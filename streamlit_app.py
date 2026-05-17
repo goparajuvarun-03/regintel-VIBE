@@ -816,45 +816,71 @@ def _mock_llm(system: str, user: str) -> dict:
 
     # Impact analysis (default for regulation analysis prompts) — match the EXACT first line of analyze_regulation()
     if "analyze the impact of this regulation" in u or "analyze the impact" in u and "internal artifacts" in u:
+        # Honor the closed-vocabulary constraint that analyze_regulation injects.
+        # Parse the AVAILABLE INTERNAL ARTIFACTS block back out of the prompt
+        # so the mock can ONLY name artifacts the user has actually uploaded.
+        vocab: list[tuple[str, str]] = []  # [(title, ui_type)]
+        vocab_match = re.search(
+            r"AVAILABLE INTERNAL ARTIFACTS[^\n]*\n(.*?)\n\nINTERNAL ARTIFACT CONTENT",
+            user, re.DOTALL,
+        )
+        if vocab_match:
+            for line in vocab_match.group(1).splitlines():
+                m = re.match(r'\s*-\s*"([^"]+)"\s*\(([^)]+)\)\s*', line)
+                if m:
+                    vocab.append((m.group(1).strip(), m.group(2).strip()))
+
+        # If the prompt has no vocab block, analyze_regulation already
+        # returned an empty-impacted_areas result before calling the LLM —
+        # but be safe and mirror that here.
+        if not vocab:
+            return {
+                "regulation_summary": (
+                    "No internal artifacts available. Upload internal "
+                    "policies, SOPs, or system docs first."
+                ),
+                "impact_score_overall": 0,
+                "impacted_areas": [],
+                "citations": [],
+            }
+
+        # Build mock impacted_areas using ONLY the real uploaded artifact titles.
+        priorities = ["High", "Medium", "Low"]
+        confidences = [0.86, 0.79, 0.72, 0.68, 0.61]
+        impacted = []
+        for i, (title, ui_type) in enumerate(vocab[:3]):
+            impacted.append({
+                "name": title,
+                "type": ui_type,
+                "priority": priorities[i % len(priorities)],
+                "impact_reason": (
+                    f"The regulation's continuity-of-care and notice "
+                    f"requirements intersect with {title}; current language "
+                    f"likely does not reflect the extended 90-day window or "
+                    f"the appeal-rights notice wording required by § 422.138."
+                ),
+                "recommended_action": (
+                    f"Review {title} against § 422.138 and revise to "
+                    f"incorporate the 90-day window and denial-notice "
+                    f"language with appeal rights."
+                ),
+                "risk_if_not_implemented": (
+                    "Civil monetary penalties; adverse audit findings; "
+                    "member harm from inappropriate denials during transition."
+                ),
+                "confidence_score": confidences[i % len(confidences)],
+                "supporting_citations": ["§ 422.138(b)", f"CHUNK_{4 + i}"],
+            })
+
         return {
             "regulation_summary": (
-                "Final Rule extends the continuity-of-care window for transitioning "
-                "members from 30 to 90 days, requires denial-notice with appeal rights, "
-                "and adds quarterly compliance reporting."
+                "Final Rule extends the continuity-of-care window for "
+                "transitioning members from 30 to 90 days, requires "
+                "denial-notice with appeal rights, and adds quarterly "
+                "compliance reporting."
             ),
-            "impact_score_overall": 82,
-            "impacted_areas": [
-                {
-                    "name": "Prior Authorization Continuity Policy",
-                    "type": "Policy",
-                    "priority": "High",
-                    "impact_reason": "Current policy honors prior plan PA decisions for 30 days. Final Rule § 422.138(b) requires not less than 90 days, plus full duration of clinically established treatment plans.",
-                    "recommended_action": "Revise § 4.2 to reflect 90-day window. Route through compliance review and republish.",
-                    "risk_if_not_implemented": "Civil monetary penalties; audit findings on transition handling.",
-                    "confidence_score": 0.86,
-                    "supporting_citations": ["§ 422.138(b)", "CHUNK_4", "CHUNK_7"],
-                },
-                {
-                    "name": "Claims Adjudication SOP",
-                    "type": "Workflow",
-                    "priority": "Medium",
-                    "impact_reason": "Workflow lacks transition-flag decision step. Claims for transitioning members are processed under standard rules without honoring prior-plan PA decisions.",
-                    "recommended_action": "Insert transition-flag decision node at Step 4 (PA check). Update SOP runbook.",
-                    "risk_if_not_implemented": "Inappropriate denials; appeals volume spike; member harm.",
-                    "confidence_score": 0.79,
-                    "supporting_citations": ["§ 422.138(b)", "CHUNK_4", "CHUNK_5"],
-                },
-                {
-                    "name": "MA Core Claims Engine",
-                    "type": "System",
-                    "priority": "Medium",
-                    "impact_reason": "PA-MOD-v4 has no interface for ingesting prior authorization records from external Medicare Advantage organizations. Manual entry creates significant operational overhead.",
-                    "recommended_action": "Add a configuration flag and PA ingestion edit rule. Plan for next sprint release.",
-                    "risk_if_not_implemented": "Manual workarounds; audit findings; operational cost overruns.",
-                    "confidence_score": 0.74,
-                    "supporting_citations": ["§ 422.138(b)", "CHUNK_4", "CHUNK_8"],
-                },
-            ],
+            "impact_score_overall": 82 if impacted else 0,
+            "impacted_areas": impacted,
             "citations": [
                 {"citation_id": "CHUNK_4", "source_title": "Final Rule",
                  "section": "§ 422.138(b)", "snippet":
@@ -1046,8 +1072,38 @@ def _mock_llm(system: str, user: str) -> dict:
 # ============================================================
 # Analysis pipeline
 # ============================================================
+def _list_available_internal_artifacts() -> list[dict]:
+    """Return the deduped list of uploaded internal artifacts (non-regulation docs).
+    Used by analyze_regulation to constrain the LLM's `impacted_areas.name` field
+    to a closed vocabulary — the actual things the user has uploaded.
+    Latest version of each title wins; earlier versions are dropped."""
+    seen: dict[str, dict] = {}
+    for kind in ("policy", "sop", "system"):
+        for d in db_list_documents(kind=kind):
+            key = (d.get("title") or "").strip().lower()
+            if not key or key in seen:
+                continue
+            # db_list_documents returns DESC by created_at, so the first hit
+            # for any title is the most recent version.
+            seen[key] = {
+                "doc_id": d["doc_id"],
+                "title": d["title"],
+                "kind": d["kind"],
+                # UI-facing type label that matches the impacted_area schema
+                "ui_type": {"policy": "Policy", "sop": "Workflow",
+                            "system": "System"}.get(d["kind"], "Policy"),
+            }
+    return list(seen.values())
+
+
 def analyze_regulation(doc_id: str) -> dict:
-    """Retrieve relevant internal docs, ask LLM for impact analysis."""
+    """Retrieve relevant internal docs, ask LLM for impact analysis.
+
+    Impact analysis is constrained to the actual uploaded internal artifacts —
+    the LLM cannot invent artifact names (Option A: closed vocabulary). If no
+    internal artifacts are uploaded, we short-circuit with an empty
+    impacted_areas list and a flag the UI uses to prompt the user to upload
+    artifacts first."""
     doc = db_get_document(doc_id)
     if not doc:
         raise ValueError(f"Document {doc_id} not found")
@@ -1055,7 +1111,29 @@ def analyze_regulation(doc_id: str) -> dict:
     chunks = db_get_chunks(doc_id)
     reg_text_excerpt = "\n\n".join(c["text"] for c in chunks[:5])[:4000]
 
-    # Retrieve relevant internal artifacts
+    # Closed vocabulary: the only artifact names the LLM is allowed to use.
+    available_artifacts = _list_available_internal_artifacts()
+
+    # No internal artifacts uploaded → nothing to map the regulation onto.
+    # Skip the LLM call entirely and return a minimal-but-honest result.
+    if not available_artifacts:
+        result = {
+            "regulation_summary": (
+                f"This regulation ({doc['title']}) has been ingested, but no "
+                "internal policies, SOPs, or systems are available to map it "
+                "against. Upload your internal artifacts on the Upload page, "
+                "then re-run analysis to identify impacted areas."
+            ),
+            "impact_score_overall": 0,
+            "impacted_areas": [],
+            "citations": [],
+            "no_internal_artifacts": True,
+        }
+        db_save_analysis(doc_id, result, 0)
+        return result
+
+    # Retrieve relevant internal artifact chunks to give the LLM real context
+    # about what the listed artifacts actually say.
     retrieved = retrieve_chunks(reg_text_excerpt[:1000], top_k=10)
     internal_retrieved = [r for r in retrieved
                          if db_get_document(r.doc_id)
@@ -1066,7 +1144,12 @@ def analyze_regulation(doc_id: str) -> dict:
         context_blocks.append(
             f"[CHUNK_{c.idx}] {c.title} ({c.section}):\n{c.text[:600]}"
         )
-    context = "\n\n".join(context_blocks) if context_blocks else "(no internal docs ingested)"
+    context = ("\n\n".join(context_blocks) if context_blocks
+              else "(no chunks retrieved — judge impact from titles in the vocabulary alone)")
+
+    # Build the closed-vocabulary listing. The LLM MUST pick `name` from this.
+    vocab_lines = [f'- "{a["title"]}" ({a["ui_type"]})' for a in available_artifacts]
+    vocab_block = "\n".join(vocab_lines)
 
     user_prompt = f"""Analyze the impact of this regulation on internal artifacts.
 
@@ -1077,16 +1160,37 @@ Effective: {doc.get('effective_date') or 'TBD'}
 REGULATION TEXT (excerpt):
 {reg_text_excerpt[:2000]}
 
-INTERNAL ARTIFACTS RETRIEVED:
+AVAILABLE INTERNAL ARTIFACTS (closed vocabulary — the ONLY allowed values for `name`):
+{vocab_block}
+
+INTERNAL ARTIFACT CONTENT (retrieved excerpts from the artifacts above):
 {context}
+
+CRITICAL CONSTRAINTS — read carefully:
+1. The `name` field of every impacted_area MUST be COPIED EXACTLY from the
+   AVAILABLE INTERNAL ARTIFACTS list above — character for character, including
+   capitalization and punctuation. Do NOT invent, rename, paraphrase, or
+   generalize artifact names.
+2. The `type` field MUST match the type shown in parentheses for that artifact
+   in the AVAILABLE INTERNAL ARTIFACTS list.
+3. If NONE of the listed artifacts are genuinely impacted by this regulation,
+   return `impacted_areas: []`. An empty list is the CORRECT answer when there
+   is no real mapping — it is strictly better than inventing entries.
+4. If the regulation implies a need for some artifact that is NOT in the list
+   (e.g. a "Member Transition Workflow" the plan should have but hasn't
+   uploaded), do NOT create a placeholder for it. Just omit it. The user can
+   upload more artifacts later and re-run.
 
 Return a JSON object with EXACTLY these keys and value types:
 - regulation_summary: string, 2-3 sentence summary
-- impact_score_overall: integer between 0 and 100 (no text, no "/100" suffix)
+- impact_score_overall: integer between 0 and 100 (no text, no "/100" suffix).
+    If impacted_areas is empty, this should be 0.
 - impacted_areas: array of objects, each with these exact keys:
-    * name: string
-    * type: one of exactly "Policy", "Workflow", or "System" (case-sensitive)
-    * priority: one of exactly "High", "Medium", or "Low" (case-sensitive, never "Critical" or other)
+    * name: string — MUST be exactly from the AVAILABLE INTERNAL ARTIFACTS list
+    * type: one of exactly "Policy", "Workflow", or "System" (must match the
+        type shown for that artifact in the vocabulary)
+    * priority: one of exactly "High", "Medium", or "Low" (case-sensitive,
+        never "Critical" or other)
     * impact_reason: string, 1-3 sentences
     * recommended_action: string, 1 sentence
     * risk_if_not_implemented: string, 1 sentence
@@ -1096,17 +1200,25 @@ Return a JSON object with EXACTLY these keys and value types:
     citation_id (string), source_title (string), section (string),
     snippet (string, the verbatim retrieved text), relevance (float 0-1)
 
-Use ONLY the allowed enum values for type and priority. Never return null, "N/A", or other variants.
+Use ONLY the allowed enum values for type and priority. Never return null,
+"N/A", or other variants.
 """
 
     result = call_llm(
-        system="You are a healthcare regulatory analyst. Identify impacts of regulations on internal payer artifacts. Cite sources by chunk_id. You always follow the JSON schema in the user prompt exactly.",
+        system=(
+            "You are a healthcare regulatory analyst. You identify impacts of "
+            "regulations on internal payer artifacts. You ONLY name artifacts "
+            "that are explicitly listed in the AVAILABLE INTERNAL ARTIFACTS "
+            "section of the user prompt — never invent artifact names. You "
+            "always follow the JSON schema in the user prompt exactly."
+        ),
         user=user_prompt,
         max_tokens=2500,
     )
 
-    # Sanitize the result — coerce values to safe types so the UI never crashes
-    result = _sanitize_analysis_result(result)
+    # Sanitize the result and enforce the closed vocabulary post-hoc as a
+    # belt-and-braces guard against an LLM that ignores the instructions.
+    result = _sanitize_analysis_result(result, allowed_artifacts=available_artifacts)
 
     impact_score = int(result.get("impact_score_overall", 0) or 0)
     db_save_analysis(doc_id, result, impact_score)
@@ -1174,9 +1286,16 @@ def _coerce_enum(value, allowed: list, default: str) -> str:
     return default
 
 
-def _sanitize_analysis_result(result: dict) -> dict:
+def _sanitize_analysis_result(result: dict,
+                              allowed_artifacts: list[dict] | None = None) -> dict:
     """Coerce LLM output into the exact schema the UI expects.
-    Never raises. Returns a dict that's always safe to render."""
+    Never raises. Returns a dict that's always safe to render.
+
+    If allowed_artifacts is provided, enforce closed-vocabulary on impacted_areas:
+    drop any entry whose `name` doesn't match an uploaded artifact title;
+    canonicalize the `name` and `type` to match the uploaded record; attach
+    the matched `doc_id` so downstream proposed-text generation can fetch
+    verbatim chunks directly instead of doing a fuzzy lookup."""
     if not isinstance(result, dict):
         result = {}
 
@@ -1186,18 +1305,57 @@ def _sanitize_analysis_result(result: dict) -> dict:
         result.get("impact_score_overall"), default=50, lo=0, hi=100
     )
 
+    # Build the closed-vocabulary lookup (lower-cased title → artifact dict).
+    allowed_lookup: dict[str, dict] = {}
+    if allowed_artifacts:
+        for a in allowed_artifacts:
+            key = (a.get("title") or "").strip().lower()
+            if key:
+                allowed_lookup[key] = a
+
     # Impacted areas
     areas = result.get("impacted_areas") or []
     if not isinstance(areas, list):
         areas = []
-    clean_areas = []
+    clean_areas: list[dict] = []
+    dropped_names: list[str] = []
     for ia in areas:
         if not isinstance(ia, dict):
             continue
-        clean_areas.append({
-            "name": str(ia.get("name") or "Unnamed artifact"),
-            "type": _coerce_enum(ia.get("type"), ["Policy", "Workflow", "System"], "Policy"),
-            "priority": _coerce_enum(ia.get("priority"), ["High", "Medium", "Low"], "Medium"),
+        raw_name = str(ia.get("name") or "").strip()
+
+        # Closed-vocabulary check (only enforced when allowed_artifacts given).
+        matched: dict | None = None
+        if allowed_lookup:
+            matched = allowed_lookup.get(raw_name.lower())
+            if not matched:
+                # Tolerate small slack: exact title contained inside the LLM's
+                # name (e.g. it appended a version suffix). Reject anything
+                # that doesn't clearly map to one uploaded artifact.
+                for key, art in allowed_lookup.items():
+                    if key and key in raw_name.lower():
+                        matched = art
+                        break
+            if not matched:
+                dropped_names.append(raw_name or "(blank)")
+                continue
+            canonical_name = matched["title"]
+            canonical_type = matched.get("ui_type") or _coerce_enum(
+                ia.get("type"), ["Policy", "Workflow", "System"], "Policy"
+            )
+            matched_doc_id = matched["doc_id"]
+        else:
+            canonical_name = raw_name or "Unnamed artifact"
+            canonical_type = _coerce_enum(
+                ia.get("type"), ["Policy", "Workflow", "System"], "Policy"
+            )
+            matched_doc_id = None
+
+        entry = {
+            "name": canonical_name,
+            "type": canonical_type,
+            "priority": _coerce_enum(ia.get("priority"),
+                                    ["High", "Medium", "Low"], "Medium"),
             "impact_reason": str(ia.get("impact_reason") or ""),
             "recommended_action": str(ia.get("recommended_action") or ""),
             "risk_if_not_implemented": str(ia.get("risk_if_not_implemented") or ""),
@@ -1206,8 +1364,19 @@ def _sanitize_analysis_result(result: dict) -> dict:
                 str(x) for x in (ia.get("supporting_citations") or [])
                 if x is not None
             ],
-        })
+        }
+        if matched_doc_id:
+            entry["doc_id"] = matched_doc_id
+        clean_areas.append(entry)
+
     result["impacted_areas"] = clean_areas
+    if dropped_names:
+        # Surface this so we can show a debug breadcrumb in logs / UI.
+        result["_dropped_invented_names"] = dropped_names
+        logger.info(
+            "Dropped %d invented impacted_area name(s) outside closed vocabulary: %s",
+            len(dropped_names), dropped_names
+        )
 
     # Citations
     cites = result.get("citations") or []
@@ -1295,12 +1464,31 @@ STRICT RULES FOR old_text AND new_text:
 #   1. LLM call to draft the language-change section (the part the AI is uniquely good at)
 #   2. python-docx assembly using analysis data + LLM output + sane defaults
 
-def _find_matching_internal_doc(impacted_area_name: str) -> dict | None:
-    """Find an uploaded internal artifact whose title best matches the given name.
+def _find_matching_internal_doc(impacted_area_or_name) -> dict | None:
+    """Find the uploaded internal artifact for an impacted_area entry.
+
+    Accepts either:
+      - a string (artifact name) — legacy callers
+      - a dict (the impacted_area entry) — preferred; uses the embedded
+        `doc_id` if present (set by the closed-vocabulary sanitizer),
+        otherwise falls back to title matching.
+
     Returns the document row (with doc_id, title, kind) or None if no match."""
-    if not impacted_area_name:
+    name: str
+    if isinstance(impacted_area_or_name, dict):
+        # Fast path: if the sanitizer attached a doc_id, just fetch it.
+        doc_id = impacted_area_or_name.get("doc_id")
+        if doc_id:
+            d = db_get_document(doc_id)
+            if d:
+                return d
+        name = impacted_area_or_name.get("name", "")
+    else:
+        name = str(impacted_area_or_name or "")
+
+    if not name:
         return None
-    target = impacted_area_name.strip().lower()
+    target = name.strip().lower()
     # Search across all non-regulation document kinds
     candidates: list[dict] = []
     for kind in ("policy", "sop", "system", "workflow"):
@@ -1356,8 +1544,10 @@ def generate_proposed_text(regulation_doc: dict, analysis_result: dict,
     and source_section (the artifact section the verbatim quote came from, or None).
     Falls back to safe defaults on failure."""
 
-    # Step 1: try to find the actual uploaded internal artifact
-    matched_doc = _find_matching_internal_doc(impacted_area.get("name", ""))
+    # Step 1: try to find the actual uploaded internal artifact.
+    # Prefer the doc_id the closed-vocabulary sanitizer attached; fall back
+    # to title matching for any legacy/cached analyses.
+    matched_doc = _find_matching_internal_doc(impacted_area)
 
     # Step 2: if found, retrieve the chunks most relevant to the gap description
     artifact_chunks: list[dict] = []
@@ -2403,6 +2593,20 @@ def page_impact():
 
     res = cached["result"]
     score = int(res.get("impact_score_overall", cached.get("impact_score", 0)))
+
+    # Closed-vocabulary: if no internal artifacts were available at analysis
+    # time, the result will have an empty impacted_areas list and this flag.
+    # Tell the user explicitly what to do instead of showing an empty page.
+    if res.get("no_internal_artifacts"):
+        st.warning(
+            "**No internal artifacts uploaded yet.** Impact analysis maps a "
+            "regulation against your uploaded policies, SOPs, and system "
+            "docs — but none are available, so there's nothing to map "
+            "against. Upload internal artifacts on the **Upload** page "
+            "(set *Kind* to *Internal Policy*, *SOP / Workflow*, or "
+            "*System Doc*), then come back here and click "
+            "**Run / refresh analysis** again."
+        )
 
     h_l, h_r = st.columns([2.2, 1])
     with h_l:
